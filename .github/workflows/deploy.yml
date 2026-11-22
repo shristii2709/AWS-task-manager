@@ -1,0 +1,105 @@
+
+name: AWS Deployment
+
+on:
+  push:
+    branches:
+      - main
+
+env:
+  LAMBDA_REGION: us-east-1
+  S3_REGION: ${{ vars.S3_REGION || 'us-east-1' }}
+  LAMBDA_NAME: task-manager-backend
+  API_URL: https://6xah56w6v56k2nlokc7cqrjh6i0msusz.lambda-url.us-east-1.on.aws/
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+
+    permissions:
+      id-token: write
+      contents: read
+
+    steps:
+      # 1. Download repository
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      # 2. Validate frontend and backend
+      - name: Validate Application Files
+        run: |
+          for f in Frontend/index.html Frontend/style.css Frontend/script.js backend/lambda_function.py; do
+            test -f "$f" || {
+              echo "Missing file: $f"
+              exit 1
+            }
+          done
+
+          python -m py_compile backend/lambda_function.py
+
+          grep -qi "<html" Frontend/index.html || {
+            echo "Invalid HTML file"
+            exit 1
+          }
+
+          echo "Application validation successful"
+
+      # 3. Authenticate GitHub with AWS using OIDC
+      - name: Configure AWS Credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: ${{ env.LAMBDA_REGION }}
+
+      # 4. Deploy frontend to S3
+      - name: Deploy Frontend to S3
+        run: |
+          aws s3 sync Frontend/ s3://${{ secrets.S3_BUCKET }}/ \
+            --region ${{ env.S3_REGION }}
+
+      # 5. Package Python backend
+      - name: Package Backend
+        run: |
+          cd backend
+          zip function.zip lambda_function.py
+
+      # 6. Deploy Python backend to Lambda
+      - name: Deploy Backend to Lambda
+        run: |
+          aws lambda update-function-code \
+            --function-name ${{ env.LAMBDA_NAME }} \
+            --zip-file fileb://backend/function.zip \
+            --region ${{ env.LAMBDA_REGION }}
+
+          aws lambda wait function-updated \
+            --function-name ${{ env.LAMBDA_NAME }} \
+            --region ${{ env.LAMBDA_REGION }}
+
+      # 7. Test backend
+      - name: Smoke Test Backend
+        run: |
+          STATUS=$(curl -sS -o response.json \
+            -w "%{http_code}" "${{ env.API_URL }}tasks")
+
+          echo "Backend HTTP Status: $STATUS"
+          cat response.json
+
+          test "$STATUS" = "200"
+
+          echo "Backend API is working!"
+
+      # 8. Test frontend
+      - name: Smoke Test Frontend
+        if: ${{ vars.SITE_URL != '' }}
+        run: |
+          sleep 5
+
+          curl --fail --silent --show-error "${{ vars.SITE_URL }}" \
+            | grep -i "TaskFlow"
+
+          echo "Frontend is live!"
+
+      # 9. Complete deployment
+      - name: Deployment Completed
+        run: |
+          echo "Task Manager successfully deployed to AWS!"
