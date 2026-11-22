@@ -4,12 +4,11 @@ import boto3
 import os
 import uuid
 import logging
-import base64
 
 from datetime import datetime, timezone
 from botocore.exceptions import ClientError
 
-# Logging configuration
+# Logging
 logger = logging.getLogger()
 logger.setLevel(logging.INFO)
 
@@ -20,8 +19,6 @@ table = dynamodb.Table(TABLE_NAME)
 
 
 def response(status_code, body):
-    """Create a standard HTTP response."""
-
     return {
         "statusCode": status_code,
         "headers": {
@@ -32,28 +29,25 @@ def response(status_code, body):
 
 
 def get_request_body(event):
-    """Read and decode request body."""
-
     body = event.get("body") or "{}"
-
-    if event.get("isBase64Encoded"):
-        body = base64.b64decode(body).decode("utf-8")
-
     return json.loads(body)
 
 
-def get_task_id(event):
-    """Extract task ID from URL path or query string."""
+def normalize_task(item):
+    """Convert DynamoDB attributes into frontend format."""
 
-    path = event.get("rawPath", "").rstrip("/")
-    parts = path.split("/")
+    status = item.get("status", "Pending")
 
-    if len(parts) >= 3 and parts[-2] == "tasks":
-        return parts[-1]
-
-    query = event.get("queryStringParameters") or {}
-
-    return query.get("task_id")
+    return {
+        "id": item.get("task_id"),
+        "title": item.get("title", ""),
+        "description": item.get("description", ""),
+        "priority": item.get("priority", "medium"),
+        "category": item.get("category", "Other"),
+        "due": item.get("due", ""),
+        "done": status == "Completed",
+        "createdAt": item.get("createdAt", 0)
+    }
 
 
 def lambda_handler(event, context):
@@ -66,10 +60,6 @@ def lambda_handler(event, context):
         )
 
         logger.info("Received request: %s", method)
-
-        # Handle CORS preflight if it reaches Lambda
-        if method == "OPTIONS":
-            return response(200, {"message": "CORS preflight successful"})
 
         # GET: Fetch all tasks
         if method == "GET":
@@ -88,12 +78,11 @@ def lambda_handler(event, context):
                     result["LastEvaluatedKey"]
                 )
 
-            return response(200, {
-                "message": "Tasks retrieved successfully",
-                "tasks": items
-            })
+            tasks = [normalize_task(item) for item in items]
 
-        # POST: Create a new task
+            return response(200, tasks)
+
+        # POST: Create task
         elif method == "POST":
 
             data = get_request_body(event)
@@ -102,73 +91,67 @@ def lambda_handler(event, context):
 
             if not title:
                 return response(400, {
-                    "error": "Task title is required"
+                    "message": "Task title is required"
                 })
 
-            now = datetime.now(timezone.utc).isoformat()
+            now = int(datetime.now(timezone.utc).timestamp() * 1000)
 
             task = {
                 "task_id": str(uuid.uuid4()),
                 "title": title,
                 "description": data.get("description", ""),
+                "priority": data.get("priority", "medium"),
+                "category": data.get("category", "Other"),
+                "due": data.get("due", ""),
                 "status": "Pending",
-                "created_at": now,
-                "updated_at": now
+                "createdAt": now
             }
 
             table.put_item(Item=task)
 
             logger.info("Task created: %s", task["task_id"])
 
-            return response(201, {
-                "message": "Task created successfully",
-                "task": task
-            })
+            return response(201, normalize_task(task))
 
-        # PUT: Update an existing task
+        # PUT: Update task
         elif method == "PUT":
 
-            task_id = get_task_id(event)
+            data = get_request_body(event)
+            task_id = data.get("id")
 
             if not task_id:
                 return response(400, {
-                    "error": "Task ID is required in /tasks/{task_id}"
+                    "message": "Task ID is required"
                 })
 
-            data = get_request_body(event)
+            updates = {}
 
-            allowed_fields = ["title", "description", "status"]
+            allowed_fields = [
+                "title",
+                "priority",
+                "category",
+                "due"
+            ]
 
-            updates = {
-                key: value
-                for key, value in data.items()
-                if key in allowed_fields
-            }
+            for field in allowed_fields:
+                if field in data:
+                    updates[field] = data[field]
+
+            if "done" in data:
+                updates["status"] = (
+                    "Completed" if data["done"] else "Pending"
+                )
 
             if not updates:
                 return response(400, {
-                    "error": "No valid fields provided for update"
+                    "message": "No valid fields to update"
                 })
 
             if "title" in updates:
                 if not isinstance(updates["title"], str) or not updates["title"].strip():
                     return response(400, {
-                        "error": "Title cannot be empty"
+                        "message": "Title cannot be empty"
                     })
-
-            if "status" in updates:
-                if updates["status"] not in [
-                    "Pending",
-                    "In Progress",
-                    "Completed"
-                ]:
-                    return response(400, {
-                        "error": "Invalid task status"
-                    })
-
-            updates["updated_at"] = datetime.now(
-                timezone.utc
-            ).isoformat()
 
             expression_names = {}
             expression_values = {}
@@ -193,26 +176,27 @@ def lambda_handler(event, context):
                     ReturnValues="ALL_NEW"
                 )
 
-                return response(200, {
-                    "message": "Task updated successfully",
-                    "task": result["Attributes"]
-                })
+                return response(
+                    200,
+                    normalize_task(result["Attributes"])
+                )
 
             except ClientError as error:
                 if error.response["Error"]["Code"] == "ConditionalCheckFailedException":
                     return response(404, {
-                        "error": "Task not found"
+                        "message": "Task not found"
                     })
                 raise
 
-        # DELETE: Delete a task
+        # DELETE: Delete task
         elif method == "DELETE":
 
-            task_id = get_task_id(event)
+            query = event.get("queryStringParameters") or {}
+            task_id = query.get("id")
 
             if not task_id:
                 return response(400, {
-                    "error": "Task ID is required in /tasks/{task_id}"
+                    "message": "Task ID is required"
                 })
 
             try:
@@ -224,25 +208,24 @@ def lambda_handler(event, context):
                 logger.info("Task deleted: %s", task_id)
 
                 return response(200, {
-                    "message": "Task deleted successfully",
-                    "task_id": task_id
+                    "message": "Task deleted successfully"
                 })
 
             except ClientError as error:
                 if error.response["Error"]["Code"] == "ConditionalCheckFailedException":
                     return response(404, {
-                        "error": "Task not found"
+                        "message": "Task not found"
                     })
                 raise
 
         else:
             return response(405, {
-                "error": "Method not allowed"
+                "message": "Method not allowed"
             })
 
     except Exception:
         logger.exception("Task Manager API error")
 
         return response(500, {
-            "error": "Internal server error"
+            "message": "Internal server error"
         })
